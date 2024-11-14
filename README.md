@@ -1,7 +1,9 @@
 # title-extractor
 # installation
 clone the repo
+
 go build -o titlextractor titlextractor.go
+
 mv titlextractor /usr/local/bin
 
 # Usage
