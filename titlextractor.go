@@ -2,6 +2,7 @@ package main
 
 import (
     "bufio"
+    "context"
     "crypto/tls"
     "flag"
     "fmt"
@@ -16,13 +17,12 @@ import (
     "golang.org/x/net/html"
 )
 
-// ANSI color codes
 const (
-    colorReset  = "\033[0m"
-    colorGreen  = "\033[32m"
-    colorYellow = "\033[33m"  // Yellow (for 3xx)
-    colorOrange = "\033[33;1m" // Brighter yellow as "orange" (for 4xx)
-    colorMagenta = "\033[35m"  // Magenta (for 5xx)
+    colorReset   = "\033[0m"
+    colorGreen   = "\033[32m"
+    colorYellow  = "\033[33m"
+    colorOrange  = "\033[33;1m"
+    colorMagenta = "\033[35m"
 )
 
 type result struct {
@@ -30,7 +30,6 @@ type result struct {
     responseCode    int
 }
 
-// Extract the title from the HTML body
 func getTitle(body io.ReadCloser) string {
     defer body.Close()
     tokenizer := html.NewTokenizer(body)
@@ -38,11 +37,11 @@ func getTitle(body io.ReadCloser) string {
     for {
         tokenType := tokenizer.Next()
         if tokenType == html.ErrorToken {
-            if err := tokenizer.Err(); err == io.EOF {
+            if tokenizer.Err() == io.EOF {
                 break
-            } else {
-                title = err.Error()
             }
+            title = tokenizer.Err().Error()
+            break
         }
         if tokenType == html.StartTagToken {
             token := tokenizer.Token()
@@ -56,12 +55,23 @@ func getTitle(body io.ReadCloser) string {
     return strings.TrimSpace(strings.Join(strings.Fields(title), " "))
 }
 
-// Fetches content for a given URL and extracts its title
 func getWebContent(client *http.Client, wg *sync.WaitGroup, urls <-chan string, results chan<- result) {
     defer wg.Done()
     for url := range urls {
         res := result{url: url}
-        response, err := client.Get(url)
+
+        ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+        req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+        if err != nil {
+            res.err = err.Error()
+            results <- res
+            cancel()
+            continue
+        }
+
+        response, err := client.Do(req)
+        cancel() // Cancel the context whether it failed or succeeded
+
         if err != nil {
             res.err = err.Error()
             results <- res
@@ -77,43 +87,50 @@ func getWebContent(client *http.Client, wg *sync.WaitGroup, urls <-chan string, 
 func colorForStatusCode(statusCode int) string {
     switch {
     case statusCode >= 200 && statusCode < 300:
-        return colorGreen  // 2xx: Success
+        return colorGreen
     case statusCode >= 300 && statusCode < 400:
-        return colorYellow // 3xx: Redirection
+        return colorYellow
     case statusCode >= 400 && statusCode < 500:
-        return colorOrange // 4xx: Client Error (as "orange")
+        return colorOrange
     case statusCode >= 500:
-        return colorMagenta // 5xx: Server Error
+        return colorMagenta
     default:
-        return colorReset   // No color for unhandled codes
+        return colorReset
     }
 }
 
 func main() {
     var concurrent int
-    var forceFlag bool
-
     flag.IntVar(&concurrent, "c", 5, "Number of concurrent workers")
-    flag.BoolVar(&forceFlag, "f", false, "Force flag (currently not used)")
     flag.Parse()
 
-    // Reading URLs from stdin in a piped manner
+    urls := make(chan string, concurrent*2)
+    results := make(chan result, concurrent*2)
+
     scanner := bufio.NewScanner(os.Stdin)
-    urls := make(chan string)
+
+    // Set large buffer for long URLs
+    buf := make([]byte, 0, 1024*1024)
+    scanner.Buffer(buf, 1024*1024)
+
     go func() {
         for scanner.Scan() {
-            urls <- scanner.Text()
+            line := strings.TrimSpace(scanner.Text())
+            if line != "" {
+                urls <- line
+            }
+        }
+        if err := scanner.Err(); err != nil {
+            fmt.Fprintf(os.Stderr, "[Scanner Error] %s\n", err)
         }
         close(urls)
     }()
 
-    results := make(chan result)
     var wg sync.WaitGroup
     wg.Add(concurrent)
 
-    // Setting up HTTP client with proper timeout
     client := &http.Client{
-        Timeout: 10 * time.Second,
+        Timeout: 15 * time.Second,
         Transport: &http.Transport{
             DialContext: (&net.Dialer{
                 Timeout:   5 * time.Second,
